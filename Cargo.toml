@@ -1,49 +1,11 @@
-[workspace]
-resolver = "2" # What does this do?
-members = [".", "./examples/flip_cards", "./examples/calculator", "./examples/synth"]
-default-members = ["."]
-
-[workspace.dependencies]
-rui = { path = "." }
-
 [package]
-name = "rui"
-description = "Experimental Declarative UI library"
-version = "0.6.1"
-license = "MIT"
-readme = "README.md"
-authors = ["Taylor Holliday <taylor@audulus.com>"]
-keywords = ["ui", "gui", "declarative"]
-categories = ["gui"]
-repository = "https://github.com/audulus/rui"
-edition = "2018"
-exclude = [ "screenshots/*" ]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[features]
-default = [ "winit" ]
+name = "uvea"
+version = "0.0.1"
+edition = "2021"
 
 [dependencies]
-euclid = "0.22.7"
-wgpu = { version = "25.0.0", features = []}
-futures = "0.3"
-vger = { path = "crates/vger-rs" }
-accesskit = "0.16.0"
-lazy_static = "1.4.0"
-winit = { version = "0.30", optional = true }
-log = "0.4"
-dyn-clone = "1.0.17"
-
-[dependencies.wgpu-types]
-version = "25.0.0"
-features = ["trace"]
-
-# Seems we can't publish to crates.io with this dependency.
-# baseview = { git = "https://github.com/RustAudio/baseview", optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2.76"
-web-sys = { version = "^0.3.61", features = ["Location"] }
-console_log = "1"
-console_error_panic_hook = "0.1.6"
+sdl2 = "0.38.0"
+gl = "0.14.0"
+fontdue = "0.9.3"
+arrayvec = "0.7.6"
+unicode-segmentation = "1.13.2"

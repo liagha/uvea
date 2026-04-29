@@ -1,479 +1,379 @@
-use crate::*;
-use euclid::*;
-use std::any::Any;
-use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
-use std::iter::FromIterator;
-use std::ops;
-use std::sync::Arc;
+// src/context.rs
+use arrayvec::ArrayVec;
+use crate::types::*;
+use crate::stack;
+use crate::pool::Pool;
 
-pub type LocalSpace = vger::defs::LocalSpace;
-pub type WorldSpace = vger::defs::WorldSpace;
-pub type LocalRect = Rect<f32, LocalSpace>;
-pub type LocalOffset = Vector2D<f32, LocalSpace>;
-pub type LocalSize = Size2D<f32, LocalSpace>;
-pub type LocalPoint = Point2D<f32, LocalSpace>;
-pub type WorldRect = Rect<f32, WorldSpace>;
-pub type WorldPoint = Point2D<f32, WorldSpace>;
-pub type LocalToWorld = Transform2D<f32, LocalSpace, WorldSpace>;
-pub type WorldToLocal = Transform2D<f32, WorldSpace, LocalSpace>;
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct CommandInfo {
-    pub path: Arc<str>,
-    pub key: Option<HotKey>,
-}
-
-pub const DEBUG_LAYOUT: bool = false;
-
-#[derive(Copy, Clone, Default, PartialEq, Debug)]
-pub(crate) struct LayoutBox {
-    pub rect: LocalRect,
-    pub offset: LocalOffset,
-}
-
-pub(crate) struct StateHolder {
-    pub state: Box<dyn Any>,
-    pub dirty: bool,
-}
-
-pub(crate) type StateMap = HashMap<ViewId, StateHolder>;
-
-pub(crate) type EnvMap = HashMap<TypeId, Box<dyn Any>>;
-
-pub struct RenderInfo<'a, 'window> {
-    pub device: &'a wgpu::Device,
-    pub surface: &'a wgpu::Surface<'window>,
-    pub config: &'a wgpu::SurfaceConfiguration,
-    pub queue: &'a wgpu::Queue,
-}
-
-/// The Context stores all UI state. A user of the library
-/// shouldn't have to interact with it directly.
-pub struct Context {
-    /// Layout information for all views.
-    layout: HashMap<IdPath, LayoutBox>,
-
-    /// Allocated ViewIds.
-    view_ids: HashMap<IdPath, ViewId>,
-
-    /// Next allocated id.
-    next_id: ViewId,
-
-    /// Which views each touch (or mouse pointer) is interacting with.
-    pub(crate) touches: [ViewId; 16],
-
-    /// Points at which touches (or click-drags) started.
-    pub(crate) starts: [LocalPoint; 16],
-
-    /// Previous touch/mouse positions.
-    pub(crate) previous_position: [LocalPoint; 16],
-
-    /// Current mouse button for event handling.
-    pub(crate) mouse_button: Option<MouseButton>,
-
-    /// Mouse button state.
-    pub mouse_buttons: MouseButtons,
-
-    /// Keyboard modifiers state.
-    pub key_mods: KeyboardModifiers,
-
-    /// The view that has the keyboard focus.
-    pub(crate) focused_id: Option<ViewId>,
-
-    /// The current title of the window
-    pub window_title: Arc<str>,
-
-    /// Are we fullscreen?
-    pub fullscreen: bool,
-
-    /// User state created by `state`.
-    pub(crate) state_map: StateMap,
-
-    /// Has the state changed?
-    pub(crate) dirty: bool,
-
-    /// Are we currently setting the dirty bit?
-    pub(crate) enable_dirty: bool,
-
-    /// Values indexed by type.
-    pub(crate) env: EnvMap,
-
-    /// Regions of window that needs repainting.
-    pub(crate) dirty_region: Region<WorldSpace>,
-
-    /// State dependencies.
-    pub(crate) deps: HashMap<ViewId, Vec<ViewId>>,
-
-    /// A stack of ids for states to get parent dependencies.
-    pub(crate) id_stack: Vec<ViewId>,
-
-    /// Previous window size.
-    window_size: Size2D<f32, WorldSpace>,
-
-    /// Offset for events at the root level.
-    root_offset: LocalOffset,
-
-    /// Render the dirty rectangle for debugging?
-    render_dirty: bool,
-
-    /// Lock the cursor in position. Useful for dragging knobs.
-    pub(crate) grab_cursor: bool,
-
-    /// Value of grab_cursor before processing event.
-    pub(crate) prev_grab_cursor: bool,
-}
-
-impl Default for Context {
-    fn default() -> Self {
-        Self::new()
+fn hash_identifier(current: Identifier, data: &[u8]) -> Identifier {
+    let mut result = current;
+    for byte in data {
+        result = (result ^ *byte as Identifier).wrapping_mul(16777619);
     }
+    result
+}
+
+pub struct Context {
+    pub text_width: Option<fn(Font, &[u8]) -> i32>,
+    pub text_height: Option<fn(Font) -> i32>,
+    pub draw_frame: fn(&mut Context, Rectangle, ColorIndex),
+    pub set_clipboard: Option<fn(&mut Context, &str)>,
+    pub get_clipboard: Option<fn(&mut Context) -> String>,
+
+    pub standard_style: Style,
+    pub style: *const Style,
+    pub hover: Identifier,
+    pub focus: Identifier,
+    pub last_identifier: Identifier,
+    pub last_bounds: Rectangle,
+    pub last_depth: i32,
+    pub focus_updated: bool,
+    pub text_focus: Identifier,
+    pub text_scroll: i32,
+    pub frame: u32,
+    pub hover_root: Option<usize>,
+    pub next_root: Option<usize>,
+    pub scroll_target: Option<usize>,
+    pub number_buffer: [u8; MAX_FORMAT],
+    pub number_edit: Identifier,
+    pub cursor: usize,
+    pub selection: usize,
+    pub scroll: Vector,
+
+    pub instructions: Vec<Instruction>,
+    pub roots: ArrayVec<usize, MAX_ROOTS>,
+    pub containers_stack: ArrayVec<usize, MAX_CONTAINERS>,
+    pub clips: ArrayVec<Rectangle, MAX_CLIPS>,
+    pub identifiers: ArrayVec<Identifier, MAX_IDENTIFIERS>,
+    pub layouts: ArrayVec<Layout, MAX_LAYOUTS>,
+    pub text_buffer: Vec<u8>,
+
+    pub container_pool: Pool<Container, POOL_CAPACITY>,
+    pub tree_pool: Pool<PoolEntry, TREE_CAPACITY>,
+
+    pub mouse: Vector,
+    pub last_mouse: Vector,
+    pub mouse_delta: Vector,
+    pub scroll_delta: Vector,
+    pub mouse_down: i32,
+    pub mouse_pressed: i32,
+    pub key_down: i32,
+    pub key_pressed: i32,
+    pub input: String,
 }
 
 impl Context {
-    pub fn new() -> Self {
-        Self {
-            layout: HashMap::new(),
-            view_ids: HashMap::new(),
-            next_id: ViewId { id: 0 },
-            touches: [ViewId::default(); 16],
-            starts: [LocalPoint::zero(); 16],
-            previous_position: [LocalPoint::zero(); 16],
-            mouse_button: None,
-            mouse_buttons: Default::default(),
-            key_mods: Default::default(),
-            focused_id: None,
-            window_title: "rui".into(),
-            fullscreen: false,
-            state_map: HashMap::new(),
-            dirty: false,
-            enable_dirty: true,
-            env: HashMap::new(),
-            dirty_region: Region::EMPTY,
-            deps: HashMap::new(),
-            id_stack: vec![],
-            window_size: Size2D::default(),
-            root_offset: LocalOffset::zero(),
-            render_dirty: false,
-            grab_cursor: false,
-            prev_grab_cursor: false,
-        }
+    pub fn new(
+        text_width: fn(Font, &[u8]) -> i32,
+        text_height: fn(Font) -> i32,
+    ) -> Self {
+        let standard_style = Style {
+            font: std::ptr::null_mut(),
+            size: Vector::new(68, 10),
+            padding: 5,
+            spacing: 4,
+            indent: 24,
+            title_height: 24,
+            scroll_size: 12,
+            thumb_size: 8,
+            corner_radius: 0.0,
+            colors: [
+                Color::new(230, 230, 230, 255),
+                Color::new(25, 25, 25, 255),
+                Color::new(50, 50, 50, 255),
+                Color::new(25, 25, 25, 255),
+                Color::new(240, 240, 240, 255),
+                Color::new(0, 0, 0, 0),
+                Color::new(75, 75, 75, 255),
+                Color::new(95, 95, 95, 255),
+                Color::new(115, 115, 115, 255),
+                Color::new(30, 30, 30, 255),
+                Color::new(35, 35, 35, 255),
+                Color::new(40, 40, 40, 255),
+                Color::new(43, 43, 43, 255),
+                Color::new(30, 30, 30, 255),
+                Color::new(80, 120, 200, 150),
+            ],
+        };
+
+        let mut result = Self {
+            text_width: Some(text_width),
+            text_height: Some(text_height),
+            draw_frame: Context::default_draw_frame,
+            set_clipboard: None,
+            get_clipboard: None,
+            standard_style,
+            style: std::ptr::null(),
+            hover: 0,
+            focus: 0,
+            last_identifier: 0,
+            last_bounds: Rectangle::default(),
+            last_depth: 0,
+            focus_updated: false,
+            text_focus: 0,
+            text_scroll: 0,
+            frame: 0,
+            hover_root: None,
+            next_root: None,
+            scroll_target: None,
+            number_buffer: [0u8; MAX_FORMAT],
+            number_edit: 0,
+            cursor: 0,
+            selection: 0,
+            scroll: Vector::default(),
+            instructions: Vec::with_capacity(MAX_INSTRUCTIONS),
+            roots: ArrayVec::new(),
+            containers_stack: ArrayVec::new(),
+            clips: ArrayVec::new(),
+            identifiers: ArrayVec::new(),
+            layouts: ArrayVec::new(),
+            text_buffer: Vec::with_capacity(32768),
+            container_pool: Pool::new(Container::default()),
+            tree_pool: Pool::new(PoolEntry::default()),
+            mouse: Vector::default(),
+            last_mouse: Vector::default(),
+            mouse_delta: Vector::default(),
+            scroll_delta: Vector::default(),
+            mouse_down: 0,
+            mouse_pressed: 0,
+            key_down: 0,
+            key_pressed: 0,
+            input: String::new(),
+        };
+        result.style = &result.standard_style as *const Style;
+        result
     }
 
-    /// Call this after the event queue is cleared.
-    pub fn update(
-        &mut self,
-        view: &impl View,
-        vger: &mut Vger,
-        access_nodes: &mut Vec<(accesskit::NodeId, accesskit::Node)>,
-        window_size: Size2D<f32, WorldSpace>,
-    ) -> bool {
-        // If the window size has changed, force a relayout.
-        if window_size != self.window_size {
-            self.deps.clear();
-            self.window_size = window_size;
+    pub fn begin_frame(&mut self) {
+        assert!(self.text_width.is_some() && self.text_height.is_some());
+        self.instructions.clear();
+        self.roots.clear();
+        self.text_buffer.clear();
+        self.scroll_target = None;
+        self.hover_root = self.next_root;
+        self.next_root = None;
+        self.mouse_delta.x = self.mouse.x - self.last_mouse.x;
+        self.mouse_delta.y = self.mouse.y - self.last_mouse.y;
+        self.frame += 1;
+    }
+
+    pub fn end_frame(&mut self) {
+        assert!(self.containers_stack.is_empty());
+        assert!(self.clips.is_empty());
+        assert!(self.identifiers.is_empty());
+        assert!(self.layouts.is_empty());
+
+        if let Some(target) = self.scroll_target {
+            let container = &mut self.container_pool.items[target];
+            container.scroll.x += self.scroll_delta.x;
+            container.scroll.y += self.scroll_delta.y;
         }
 
-        let mut path = vec![0];
+        if !self.focus_updated {
+            self.focus = 0;
+        }
+        self.focus_updated = false;
 
-        // Run any animations.
-        let mut actions = vec![];
-        view.process(&Event::Anim, &mut path, self, &mut actions);
-        assert!(path.len() == 1);
-
-        if self.dirty {
-            // Clean up state and layout.
-            let mut keep = vec![];
-            view.gc(&mut path, self, &mut keep);
-            assert!(path.len() == 1);
-            let keep_set = HashSet::<ViewId>::from_iter(keep);
-            self.state_map.retain(|k, _| keep_set.contains(k));
-
-            let mut new_layout = self.layout.clone();
-            new_layout.retain(|k, _| keep_set.contains(&self.view_id(k)));
-            self.layout = new_layout;
-
-            // Get a new accesskit tree.
-            let mut nodes = vec![];
-
-            view.access(&mut path, self, &mut nodes);
-            assert_eq!(path.len(), 1);
-
-            if nodes != *access_nodes {
-                log::debug!("access nodes:");
-                for (id, node) in &nodes {
-                    log::debug!(
-                        "  id: {:?} role: {:?}, children: {:?}",
-                        id,
-                        node.role(),
-                        node.children()
-                    );
+        if self.mouse_pressed != 0 {
+            if let (Some(next), Some(_)) = (self.next_root, self.hover_root) {
+                if self.container_pool.items[next].depth < self.last_depth
+                    && self.container_pool.items[next].depth >= 0
+                {
+                    self.bring_front(next);
                 }
-                *access_nodes = nodes;
-            } else {
-                // log::debug!("access nodes unchanged");
-            }
-
-            // XXX: we're doing layout both here and in rendering.
-            view.layout(
-                &mut path,
-                &mut LayoutArgs {
-                    sz: [window_size.width, window_size.height].into(),
-                    cx: self,
-                    text_bounds: &mut |str, size, max_width| vger.text_bounds(str, size, max_width),
-                },
-            );
-            assert_eq!(path.len(), 1);
-
-            // Get dirty rectangles.
-            view.dirty(&mut path, LocalToWorld::identity(), self);
-
-            self.clear_dirty();
-
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Redraw the UI using wgpu.
-    pub fn render(
-        &mut self,
-        render_info: RenderInfo,
-        view: &impl View,
-        vger: &mut Vger,
-        window_size: Size2D<f32, WorldSpace>,
-        scale: f32,
-    ) {
-        let surface = render_info.surface;
-        let device = render_info.device;
-        let config = render_info.config;
-        let frame = match surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(_) => {
-                surface.configure(device, config);
-                surface
-                    .get_current_texture()
-                    .expect("Failed to acquire next surface texture!")
-            }
-        };
-
-        vger.begin(window_size.width, window_size.height, scale);
-
-        let mut path = vec![0];
-        // Disable dirtying the state during layout and rendering
-        // to avoid constantly re-rendering if some state is saved.
-        self.enable_dirty = false;
-        let local_window_size = window_size.cast_unit::<LocalSpace>();
-        let sz = view.layout(
-            &mut path,
-            &mut LayoutArgs {
-                sz: local_window_size,
-                cx: self,
-                text_bounds: &mut |str, size, max_width| vger.text_bounds(str, size, max_width),
-            },
-        );
-        assert!(path.len() == 1);
-
-        // Center the root view in the window.
-        self.root_offset = ((local_window_size - sz) / 2.0).into();
-
-        vger.translate(self.root_offset);
-        view.draw(&mut path, &mut DrawArgs { cx: self, vger });
-        self.enable_dirty = true;
-
-        if self.render_dirty {
-            let paint = vger.color_paint(RED_HIGHLIGHT);
-            let xf = WorldToLocal::identity();
-            for rect in self.dirty_region.rects() {
-                vger.stroke_rect(
-                    xf.transform_point(rect.min()),
-                    xf.transform_point(rect.max()),
-                    0.0,
-                    1.0,
-                    paint,
-                );
             }
         }
 
-        self.dirty_region.clear();
+        self.key_pressed = 0;
+        self.input.clear();
+        self.mouse_pressed = 0;
+        self.scroll_delta = Vector::new(0, 0);
+        self.last_mouse = self.mouse;
 
-        let texture_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let desc = wgpu::RenderPassDescriptor {
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &texture_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..<_>::default()
-        };
-
-        vger.encode(&desc);
-
-        frame.present();
-    }
-
-    /// Process a UI event.
-    pub fn process(&mut self, view: &impl View, event: &Event) {
-        let mut actions = vec![];
-        let mut path = vec![0];
-        view.process(
-            &event.offset(-self.root_offset),
-            &mut path,
-            self,
-            &mut actions,
-        );
-
-        for action in actions {
-            if !action.is::<()>() {
-                log::debug!("unhandled action: {:?}", action.type_id());
-            }
-        }
-    }
-
-    /// Get menu commands.
-    pub fn commands(&mut self, view: &impl View, cmds: &mut Vec<CommandInfo>) {
-        let mut path = vec![0];
-        view.commands(&mut path, self, cmds);
-    }
-
-    pub(crate) fn view_id(&mut self, path: &IdPath) -> ViewId {
-        match self.view_ids.get_mut(path) {
-            Some(id) => *id,
-            None => {
-                let id = self.next_id;
-                self.view_ids.insert(path.clone(), id);
-                self.next_id.id += 1;
-                id
-            }
-        }
-    }
-
-    pub(crate) fn get_layout(&self, path: &IdPath) -> LayoutBox {
-        match self.layout.get(path) {
-            Some(b) => *b,
-            None => LayoutBox::default(),
-        }
-    }
-
-    pub(crate) fn update_layout(&mut self, path: &IdPath, layout_box: LayoutBox) {
-        match self.layout.get_mut(path) {
-            Some(bref) => *bref = layout_box,
-            None => {
-                self.layout.insert(path.clone(), layout_box);
-            }
-        }
-    }
-
-    pub(crate) fn set_layout_offset(&mut self, path: &IdPath, offset: LocalOffset) {
-        match self.layout.get_mut(path) {
-            Some(boxref) => boxref.offset = offset,
-            None => {
-                self.layout.insert(
-                    path.clone(),
-                    LayoutBox {
-                        rect: LocalRect::default(),
-                        offset: offset,
-                    },
-                );
-            }
-        }
-    }
-
-    pub(crate) fn set_dirty(&mut self) {
-        if self.enable_dirty {
-            self.dirty = true
-        }
-    }
-
-    pub(crate) fn clear_dirty(&mut self) {
-        self.dirty = false;
-        for holder in &mut self.state_map.values_mut() {
-            holder.dirty = false;
-        }
-    }
-
-    pub(crate) fn set_state<S: 'static>(&mut self, id: ViewId, value: S) {
-        self.state_map.insert(
-            id,
-            StateHolder {
-                state: Box::new(value),
-                dirty: false,
-            },
-        );
-    }
-
-    pub(crate) fn is_dirty(&self, id: ViewId) -> bool {
-        self.state_map[&id].dirty
-    }
-
-    pub(crate) fn init_state<S: 'static, D: Fn() -> S + 'static>(&mut self, id: ViewId, func: &D) {
-        self.state_map.entry(id).or_insert_with(|| StateHolder {
-            state: Box::new((func)()),
-            dirty: false,
+        self.roots.sort_by(|a, b| {
+            self.container_pool.items[*a]
+                .depth
+                .cmp(&self.container_pool.items[*b].depth)
         });
+
+        let count = self.roots.len();
+        if count == 0 {
+            return;
+        }
+
+        let head_first = {
+            let first_idx = self.roots[0];
+            self.container_pool.items[first_idx].head
+        };
+        self.instructions[0] = Instruction::Jump { target: head_first + 1 };
+
+        let len = self.instructions.len();
+
+        let mut heads = Vec::with_capacity(count);
+        let mut tails = Vec::with_capacity(count);
+        for &idx in &self.roots {
+            let container = &self.container_pool.items[idx];
+            heads.push(container.head);
+            tails.push(container.tail);
+        }
+
+        for i in 1..count {
+            let prev_tail = tails[i - 1];
+            let head = heads[i];
+            if let Instruction::Jump { target } = &mut self.instructions[prev_tail] {
+                *target = head + 1;
+            }
+        }
+
+        let last_tail = tails[count - 1];
+        if let Instruction::Jump { target } = &mut self.instructions[last_tail] {
+            *target = len;
+        }
     }
 
-    pub(crate) fn init_env<S: Clone + 'static, D: Fn() -> S + 'static>(&mut self, func: &D) -> S {
-        self.env
-            .entry(TypeId::of::<S>())
-            .or_insert_with(|| Box::new((func)()))
-            .downcast_ref::<S>()
-            .unwrap()
-            .clone()
+    pub fn set_focus(&mut self, identifier: Identifier) {
+        self.focus = identifier;
+        self.focus_updated = true;
+        if identifier == 0 {
+            self.text_focus = 0;
+            self.text_scroll = 0;
+        }
     }
 
-    pub(crate) fn set_env<S: Clone + 'static>(&mut self, value: &S) -> Option<S> {
-        let typeid = TypeId::of::<S>();
-        let old_value = self
-            .env
-            .get(&typeid)
-            .map(|b| b.downcast_ref::<S>().unwrap().clone());
-        self.env.insert(typeid, Box::new(value.clone()));
-        old_value
+    pub fn get_identifier(&mut self, data: &[u8]) -> Identifier {
+        let base = if self.identifiers.is_empty() {
+            2166136261
+        } else {
+            self.identifiers[self.identifiers.len() - 1]
+        };
+        let result = hash_identifier(base, data);
+        self.last_identifier = result;
+        result
     }
 
-    pub fn get<S>(&self, id: StateHandle<S>) -> &S
-    where
-        S: 'static,
-    {
-        self.state_map[&id.id].state.downcast_ref().unwrap()
+    pub fn push_identifier(&mut self, data: &[u8]) {
+        let id = self.get_identifier(data);
+        stack::push(&mut self.identifiers, id);
     }
 
-    pub fn get_mut<S>(&mut self, id: StateHandle<S>) -> &mut S
-    where
-        S: 'static,
-    {
-        self.set_dirty();
-
-        let holder = self.state_map.get_mut(&id.id).unwrap();
-        holder.dirty = true;
-        holder.state.downcast_mut().unwrap()
+    pub fn pop_identifier(&mut self) {
+        stack::pop(&mut self.identifiers);
     }
-}
 
-impl<S> ops::Index<StateHandle<S>> for Context
-where
-    S: 'static,
-{
-    type Output = S;
-
-    fn index(&self, index: StateHandle<S>) -> &S {
-        self.get(index)
+    pub fn push_clip(&mut self, bounds: Rectangle) {
+        let last = self.current_clip();
+        let clipped = bounds.intersect(last);
+        stack::push(&mut self.clips, clipped);
     }
-}
 
-impl<S> ops::IndexMut<StateHandle<S>> for Context
-where
-    S: 'static,
-{
-    fn index_mut(&mut self, index: StateHandle<S>) -> &mut S {
-        self.get_mut(index)
+    pub fn pop_clip(&mut self) {
+        stack::pop(&mut self.clips);
+    }
+
+    pub fn current_clip(&self) -> Rectangle {
+        assert!(!self.clips.is_empty());
+        self.clips[self.clips.len() - 1]
+    }
+
+    pub fn check_clip(&self, bounds: Rectangle) -> i32 {
+        let clip = self.current_clip();
+        if bounds.x > clip.x + clip.width || bounds.x + bounds.width < clip.x ||
+            bounds.y > clip.y + clip.height || bounds.y + bounds.height < clip.y {
+            return CLIP_ALL;
+        }
+        if bounds.x >= clip.x && bounds.x + bounds.width <= clip.x + clip.width &&
+            bounds.y >= clip.y && bounds.y + bounds.height <= clip.y + clip.height {
+            return 0;
+        }
+        CLIP_PARTIAL
+    }
+
+    pub fn current_container_index(&self) -> usize {
+        *self.containers_stack.last().expect("container stack empty")
+    }
+
+    pub fn fetch_container(
+        &mut self,
+        identifier: Identifier,
+        options: i32,
+    ) -> Option<usize> {
+        if let Some(idx) = self.container_pool.get_index(identifier) {
+            self.container_pool.entries[idx].update = self.frame;
+            let container = &self.container_pool.items[idx];
+            if container.open || options & IS_CLOSED == 0 {
+                return Some(idx);
+            }
+            return None;
+        }
+        if options & IS_CLOSED != 0 {
+            return None;
+        }
+        let (idx, container) = self.container_pool.get_or_insert(identifier, self.frame);
+        *container = Container::default();
+        container.open = true;
+        self.bring_front(idx);
+        Some(idx)
+    }
+
+    pub fn find_container(&mut self, name: &str) -> Option<usize> {
+        let identifier = self.get_identifier(name.as_bytes());
+        self.fetch_container(identifier, 0)
+    }
+
+    pub fn bring_front(&mut self, index: usize) {
+        self.last_depth += 1;
+        self.container_pool.items[index].depth = self.last_depth;
+    }
+
+    pub fn input_mouse(&mut self, x: i32, y: i32) {
+        self.mouse = Vector::new(x, y);
+    }
+
+    pub fn input_down(&mut self, x: i32, y: i32, button: i32) {
+        self.input_mouse(x, y);
+        self.mouse_down |= button;
+        self.mouse_pressed |= button;
+    }
+
+    pub fn input_up(&mut self, x: i32, y: i32, button: i32) {
+        self.input_mouse(x, y);
+        self.mouse_down &= !button;
+    }
+
+    pub fn input_scroll(&mut self, x: i32, y: i32) {
+        self.scroll_delta.x += x;
+        self.scroll_delta.y += y;
+    }
+
+    pub fn input_key(&mut self, key: i32) {
+        self.key_pressed |= key;
+        self.key_down |= key;
+    }
+
+    pub fn input_keyup(&mut self, key: i32) {
+        self.key_down &= !key;
+    }
+
+    pub fn input_text(&mut self, text: &str) {
+        self.input.push_str(text);
+    }
+
+    fn default_draw_frame(context: &mut Context, bounds: Rectangle, color_index: ColorIndex) {
+        let style = unsafe { &*context.style };
+        let color = style.colors[color_index as usize];
+        if style.corner_radius > 0.0 {
+            crate::draw::draw_rounded_rectangle(context, bounds, style.corner_radius, color);
+        } else {
+            crate::draw::draw_rectangle(context, bounds, color);
+        }
+        if color_index == ColorIndex::Scroll || color_index == ColorIndex::Thumb || color_index == ColorIndex::Title {
+            return;
+        }
+        if style.colors[ColorIndex::Border as usize].alpha != 0 {
+            if style.corner_radius > 0.0 {
+                crate::draw::draw_rounded_box(context, bounds, style.corner_radius, style.colors[ColorIndex::Border as usize]);
+            } else {
+                crate::draw::draw_box(context, bounds.expand(1), style.colors[ColorIndex::Border as usize]);
+            }
+        }
     }
 }

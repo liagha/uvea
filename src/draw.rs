@@ -1,142 +1,91 @@
-use crate::context::Context;
-use crate::types::*;
+use crate::types::{Color, Font, Icon, Image, Rect, Vec2};
 
-pub fn set_clip(context: &mut Context, bounds: Rectangle) {
-    context.instructions.push(Instruction::Clip { bounds });
+#[derive(Debug, Clone)]
+pub enum Command {
+    Clip(Rect),
+    Rect { bounds: Rect, color: Color, radius: f32, outline: bool },
+    Text { font: Font, text: String, position: Vec2, color: Color },
+    Icon { kind: Icon, bounds: Rect, color: Color },
+    Image { source: Image, bounds: Rect, tint: Color },
 }
 
-pub fn draw_rectangle(context: &mut Context, bounds: Rectangle, color: Color) {
-    let clipped = bounds.intersect(context.current_clip());
-    if clipped.width <= 0 || clipped.height <= 0 {
-        return;
-    }
-    context.instructions.push(Instruction::Rectangle {
-        bounds: clipped,
-        radius: 0.0,
-        mode: 0,
-        color,
-    });
+#[derive(Debug, Default)]
+pub struct DrawList {
+    commands: Vec<Command>,
 }
 
-pub fn draw_box(context: &mut Context, bounds: Rectangle, color: Color) {
-    let left = Rectangle::new(bounds.x, bounds.y, 1, bounds.height);
-    let right = Rectangle::new(bounds.x + bounds.width - 1, bounds.y, 1, bounds.height);
-    let top = Rectangle::new(bounds.x + 1, bounds.y, bounds.width - 2, 1);
-    let bottom = Rectangle::new(bounds.x + 1, bounds.y + bounds.height - 1, bounds.width - 2, 1);
-    draw_rectangle(context, left, color);
-    draw_rectangle(context, right, color);
-    draw_rectangle(context, top, color);
-    draw_rectangle(context, bottom, color);
-}
-
-pub fn draw_rounded_rectangle(context: &mut Context, bounds: Rectangle, radius: f32, color: Color) {
-    if radius <= 0.0 {
-        draw_rectangle(context, bounds, color);
-        return;
-    }
-    let clipped = bounds.intersect(context.current_clip());
-    if clipped.width <= 0 || clipped.height <= 0 {
-        return;
-    }
-    context.instructions.push(Instruction::Rectangle {
-        bounds: clipped,
-        radius,
-        mode: 1,
-        color,
-    });
-}
-
-pub fn draw_rounded_box(context: &mut Context, bounds: Rectangle, radius: f32, color: Color) {
-    if radius <= 0.0 {
-        draw_box(context, bounds, color);
-        return;
-    }
-    let clipped = bounds.intersect(context.current_clip());
-    if clipped.width <= 0 || clipped.height <= 0 {
-        return;
-    }
-    context.instructions.push(Instruction::Rectangle {
-        bounds: clipped,
-        radius,
-        mode: 3,
-        color,
-    });
-}
-
-pub fn draw_text(
-    context: &mut Context,
-    font: Font,
-    text: &[u8],
-    position: Vector,
-    color: Color,
-) {
-    let text_width = context.text_width.unwrap()(font, text);
-    let text_height = context.text_height.unwrap()(font);
-    let bounds = Rectangle::new(position.x, position.y, text_width, text_height);
-
-    let clipped = context.check_clip(bounds);
-    if clipped == CLIP_ALL {
-        return;
-    }
-    if clipped == CLIP_PARTIAL {
-        set_clip(context, context.current_clip());
+impl DrawList {
+    pub fn push(&mut self, cmd: Command) {
+        self.commands.push(cmd);
     }
 
-    let offset = context.text_buffer.len();
-    context.text_buffer.extend_from_slice(text);
-    let length = text.len();
+    pub fn clear(&mut self) {
+        self.commands.clear();
+    }
 
-    context.instructions.push(Instruction::Text {
-        font,
-        position,
-        color,
-        string_offset: offset,
-        string_length: length,
-    });
+    pub fn iter(&self) -> impl Iterator<Item = &Command> {
+        self.commands.iter()
+    }
 
-    if clipped != 0 {
-        set_clip(context, Rectangle::unbounded());
+    pub fn clip(&mut self, bounds: Rect) {
+        self.commands.push(Command::Clip(bounds));
     }
-}
 
-pub fn draw_icon(context: &mut Context, identifier: i32, bounds: Rectangle, color: Color) {
-    let clipped = context.check_clip(bounds);
-    if clipped == CLIP_ALL {
-        return;
+    pub fn rect(&mut self, bounds: Rect, color: Color) {
+        if bounds.w > 0 && bounds.h > 0 {
+            self.commands.push(Command::Rect {
+                bounds,
+                color,
+                radius: 0.0,
+                outline: false,
+            });
+        }
     }
-    if clipped == CLIP_PARTIAL {
-        set_clip(context, context.current_clip());
-    }
-    context.instructions.push(Instruction::Icon {
-        identifier,
-        bounds,
-        color,
-    });
-    if clipped != 0 {
-        set_clip(context, Rectangle::unbounded());
-    }
-}
 
-pub fn draw_image(context: &mut Context, source: Image, bounds: Rectangle, tint: Color) {
-    let clipped = context.check_clip(bounds);
-    if clipped == CLIP_ALL {
-        return;
+    pub fn rounded_rect(&mut self, bounds: Rect, color: Color, radius: f32) {
+        if bounds.w > 0 && bounds.h > 0 {
+            self.commands.push(Command::Rect {
+                bounds,
+                color,
+                radius,
+                outline: false,
+            });
+        }
     }
-    if clipped == CLIP_PARTIAL {
-        set_clip(context, context.current_clip());
-    }
-    context.instructions.push(Instruction::Image {
-        source,
-        bounds,
-        tint,
-    });
-    if clipped != 0 {
-        set_clip(context, Rectangle::unbounded());
-    }
-}
 
-pub fn push_jump(context: &mut Context) -> usize {
-    let idx = context.instructions.len();
-    context.instructions.push(Instruction::Jump { target: 0 });
-    idx
+    pub fn rounded_outline(&mut self, bounds: Rect, color: Color, radius: f32) {
+        if bounds.w > 0 && bounds.h > 0 {
+            self.commands.push(Command::Rect {
+                bounds,
+                color,
+                radius,
+                outline: true,
+            });
+        }
+    }
+
+    pub fn border(&mut self, bounds: Rect, color: Color) {
+        let e = bounds.expand(1);
+        self.rect(Rect::new(e.x + 1, e.y, e.w - 2, 1), color);
+        self.rect(Rect::new(e.x + 1, e.y + e.h - 1, e.w - 2, 1), color);
+        self.rect(Rect::new(e.x, e.y, 1, e.h), color);
+        self.rect(Rect::new(e.x + e.w - 1, e.y, 1, e.h), color);
+    }
+
+    pub fn text(&mut self, font: Font, text: impl Into<String>, position: Vec2, color: Color) {
+        self.commands.push(Command::Text {
+            font,
+            text: text.into(),
+            position,
+            color,
+        });
+    }
+
+    pub fn icon(&mut self, kind: Icon, bounds: Rect, color: Color) {
+        self.commands.push(Command::Icon { kind, bounds, color });
+    }
+
+    pub fn image(&mut self, source: Image, bounds: Rect, tint: Color) {
+        self.commands.push(Command::Image { source, bounds, tint });
+    }
 }

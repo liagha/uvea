@@ -1,432 +1,313 @@
-// src/window.rs
+use crate::{
+    context::Context,
+    controls,
+    types::*,
+};
 
-use crate::context::Context;
-use crate::draw::*;
-use crate::types::*;
-use std::cmp;
+pub fn begin_window(
+    ctx: &mut Context,
+    title: &str,
+    initial: Rect,
+    options: Options,
+) -> Response {
+    let id = ctx.id_str(title);
+    let closed = options.contains(Options::IS_CLOSED);
+    let Some(idx) = ctx.fetch_container(id, closed) else {
+        return Response::empty();
+    };
 
-impl Context {
-    fn draw_header_control(
-        &mut self,
-        label: &str,
-        tree: bool,
-        options: i32,
-    ) -> i32 {
-        let identifier = self.get_identifier(label.as_bytes());
-        let pool_idx = self.tree_pool.get_index(identifier);
-        let width = -1;
-        self.layout_row(1, Some(&[width]), 0);
+    {
+        let container = &mut ctx.context_containers()[idx];
+        if !container.open {
+            return Response::empty();
+        }
+        if container.bounds.w == 0 {
+            container.bounds = initial;
+        }
+    }
 
-        let mut active = pool_idx.is_some();
-        let expanded = if options & IS_EXPANDED != 0 { !active } else { active };
-        let bounds = self.next_bounds();
-        self.update_control(identifier, bounds, 0);
+    ctx.push_id(id.to_le_bytes().as_ref());
+    ctx.push_container(idx);
 
-        active ^= self.mouse_pressed == MOUSE_LEFT && self.focus == identifier;
+    let bounds = ctx.context_containers()[idx].bounds;
+    let mut body = bounds;
 
-        if let Some(idx) = pool_idx {
-            if active {
-                self.tree_pool.entries[idx].update = self.frame;
-            } else {
-                self.tree_pool.entries[idx] = PoolEntry::default();
-            }
-        } else if active {
-            let entry = self.tree_pool.get_or_insert(identifier, self.frame).1;
-            *entry = PoolEntry::default();
+    if !options.contains(Options::NO_FRAME) {
+        let color = ctx.style.color(ColorSlot::Window);
+        ctx.draws.rect(bounds, color);
+    }
+
+    if !options.contains(Options::NO_TITLE) {
+        let title_h = ctx.style.title_height;
+        let title_rect = Rect::new(bounds.x, bounds.y, bounds.w, title_h);
+        let title_color = ctx.style.color(ColorSlot::Title);
+        ctx.draws.rect(title_rect, title_color);
+
+        let title_id = ctx.id_str("!title");
+        controls::update(ctx, title_id, title_rect, options);
+        let heading_color = ctx.style.color(ColorSlot::Heading);
+        let font = ctx.style.font;
+        let pos = Vec2::new(title_rect.x + ctx.style.padding, title_rect.y + title_h / 4);
+        ctx.draws.text(font, title.to_string(), pos, heading_color);
+
+        if ctx.focus == title_id && ctx.mouse_down == Mouse::Left as u32 {
+            ctx.context_containers()[idx].bounds.x += ctx.delta.x;
+            ctx.context_containers()[idx].bounds.y += ctx.delta.y;
         }
 
-        if tree {
-            if self.hover == identifier {
-                let draw = self.draw_frame;
-                draw(self, bounds, ColorIndex::ButtonHover);
+        body.y += title_h;
+        body.h -= title_h;
+
+        if !options.contains(Options::NO_CLOSE) {
+            let close_id = ctx.id_str("!close");
+            let close = Rect::new(title_rect.x + title_rect.w - title_h, title_rect.y, title_h, title_h);
+            ctx.draws.icon(Icon::Close, close, heading_color);
+            controls::update(ctx, close_id, close, options);
+            if ctx.mouse_pressed == Mouse::Left as u32 && ctx.focus == close_id {
+                ctx.context_containers()[idx].open = false;
             }
+        }
+    }
+
+    push_body(ctx, idx, body, options);
+
+    if !options.contains(Options::NO_RESIZE) {
+        let size = ctx.style.title_height;
+        let resize_id = ctx.id_str("!resize");
+        let resize = Rect::new(bounds.x + bounds.w - size, bounds.y + bounds.h - size, size, size);
+        controls::update(ctx, resize_id, resize, options);
+        if ctx.focus == resize_id && ctx.mouse_down == Mouse::Left as u32 {
+            let (dx, dy) = (ctx.delta.x, ctx.delta.y);
+            ctx.context_containers()[idx].bounds.w = (ctx.context_containers()[idx].bounds.w + dx).max(96);
+            ctx.context_containers()[idx].bounds.h = (ctx.context_containers()[idx].bounds.h + dy).max(64);
+        }
+    }
+
+    // Fix E0499: extract body rect before calling push_clip to avoid double borrow
+    let body_rect = ctx.context_containers()[idx].body;
+    ctx.push_clip(body_rect);
+    Response::ACTIVE
+}
+
+pub fn end_window(ctx: &mut Context) {
+    ctx.pop_clip();
+    ctx.pop_container();
+}
+
+pub fn begin_panel(ctx: &mut Context, name: &str, options: Options) {
+    ctx.push_id(name.as_bytes());
+    let id = ctx.last_id;
+    let Some(idx) = ctx.fetch_container(id, false) else { return; };
+    let bounds = ctx.next_bounds();
+    ctx.context_containers()[idx].bounds = bounds;
+
+    if !options.contains(Options::NO_FRAME) {
+        let color = ctx.style.color(ColorSlot::Panel);
+        ctx.draws.rect(bounds, color);
+    }
+
+    ctx.push_container_raw(idx);
+    push_body(ctx, idx, bounds, options);
+
+    // Fix E0499: extract body before calling push_clip
+    let body_rect = ctx.context_containers()[idx].body;
+    ctx.push_clip(body_rect);
+}
+
+pub fn end_panel(ctx: &mut Context) {
+    ctx.pop_clip();
+    ctx.pop_container();
+}
+
+pub fn open_popup(ctx: &mut Context, name: &str) {
+    let id = ctx.id_str(name);
+    let Some(idx) = ctx.fetch_container(id, false) else { return; };
+    ctx.hover_root = Some(idx);
+    ctx.next_root = Some(idx);
+    ctx.context_containers()[idx].bounds = Rect::new(ctx.mouse.x, ctx.mouse.y, 1, 1);
+    ctx.context_containers()[idx].open = true;
+    ctx.bring_front(idx);
+}
+
+pub fn begin_popup(ctx: &mut Context, name: &str) -> Response {
+    let options = Options::IS_POPUP
+        | Options::AUTO_SIZE
+        | Options::NO_RESIZE
+        | Options::NO_SCROLL
+        | Options::NO_TITLE
+        | Options::IS_CLOSED;
+    begin_window(ctx, name, Rect::default(), options)
+}
+
+pub fn end_popup(ctx: &mut Context) {
+    end_window(ctx);
+}
+
+pub fn begin_tree(ctx: &mut Context, label: &str, options: Options) -> Response {
+    let id = ctx.id_str(label);
+    let active = ctx.fetch_tree(id);
+    let expanded = if options.contains(Options::IS_EXPANDED) { !active } else { active };
+
+    let width = -1i32;
+    let layout = ctx.layout();
+    layout.row(1, &[width], 0);
+    let bounds = ctx.next_bounds();
+    controls::update(ctx, id, bounds, Options::empty());
+
+    let toggled = ctx.mouse_pressed == Mouse::Left as u32 && ctx.focus == id;
+    let new_active = active ^ toggled;
+
+    if active {
+        if new_active {
+            ctx.update_tree(id);
         } else {
-            self.control_frame(identifier, bounds, ColorIndex::Button, 0);
+            ctx.deactivate_tree(id);
         }
-
-        let icon = if expanded { 4 } else { 3 };
-        let style = unsafe { &*self.style };
-        draw_icon(
-            self,
-            icon,
-            Rectangle::new(bounds.x, bounds.y, bounds.height, bounds.height),
-            style.colors[ColorIndex::Text as usize],
-        );
-        let mut label_bounds = bounds;
-        label_bounds.x += bounds.height - style.padding;
-        label_bounds.width -= bounds.height - style.padding;
-        self.control_text(label, label_bounds, ColorIndex::Text, 0);
-
-        if expanded { RESULT_ACTIVE } else { 0 }
+    } else if new_active {
+        ctx.activate_tree(id);
     }
 
-    pub fn draw_header(&mut self, label: &str, options: i32) -> i32 {
-        self.draw_header_control(label, false, options)
+    let hover_color = ctx.style.color(ColorSlot::ButtonHover);
+    if ctx.hover == id {
+        ctx.draws.rect(bounds, hover_color);
     }
 
-    pub fn push_tree(&mut self, label: &str, options: i32) -> i32 {
-        let result = self.draw_header_control(label, true, options);
-        if result & RESULT_ACTIVE != 0 {
-            self.current_layout_mut().indent += unsafe { &*self.style }.indent;
-            self.identifiers.push(self.last_identifier);
-        }
-        result
+    let icon = if expanded { Icon::Expanded } else { Icon::Collapsed };
+    let icon_color = ctx.style.color(ColorSlot::Text);
+    let icon_rect = Rect::new(bounds.x, bounds.y, bounds.h, bounds.h);
+    ctx.draws.icon(icon, icon_rect, icon_color);
+
+    let text_bounds = Rect::new(
+        bounds.x + bounds.h - ctx.style.padding,
+        bounds.y,
+        bounds.w - bounds.h + ctx.style.padding,
+        bounds.h,
+    );
+    let text_color = ctx.style.color(ColorSlot::Text);
+    let font = ctx.style.font;
+    ctx.draws.text(font, label.to_string(), Vec2::new(text_bounds.x, text_bounds.y), text_color);
+
+    if expanded {
+        ctx.layout().indent += ctx.style.indent;
+        ctx.push_id(id.to_le_bytes().as_ref());
+        Response::ACTIVE
+    } else {
+        Response::empty()
+    }
+}
+
+pub fn end_tree(ctx: &mut Context) {
+    ctx.layout().indent -= ctx.style.indent;
+    ctx.pop_id();
+}
+
+fn push_body(ctx: &mut Context, idx: usize, mut body: Rect, options: Options) {
+    if !options.contains(Options::NO_SCROLL) {
+        render_scrollbars(ctx, idx, &mut body);
+    }
+    let padding = ctx.style.padding;
+    let scroll = ctx.context_containers()[idx].scroll;
+    ctx.push_layout(body.expand(-padding), scroll);
+    ctx.context_containers()[idx].body = body;
+}
+
+fn render_scrollbars(ctx: &mut Context, idx: usize, body: &mut Rect) {
+    let size = ctx.style.scroll_size;
+
+    // Fix E0503: compute content before any borrow of ctx.style.padding mixed with containers
+    let content = {
+        let padding = ctx.style.padding;
+        let c = &ctx.context_containers()[idx];
+        Vec2::new(
+            c.content.x + padding * 2,
+            c.content.y + padding * 2,
+        )
+    };
+
+    ctx.push_clip(*body);
+
+    let viewport_h = body.h;
+    let viewport_w = body.w;
+
+    if content.y > viewport_h {
+        body.w -= size;
+    }
+    if content.x > viewport_w {
+        body.h -= size;
     }
 
-    pub fn pop_tree(&mut self) {
-        self.current_layout_mut().indent -= unsafe { &*self.style }.indent;
-        self.pop_identifier();
-    }
+    render_scrollbar(ctx, idx, body, content, true);
+    render_scrollbar(ctx, idx, body, content, false);
+    ctx.pop_clip();
+}
 
-    pub fn push_window(
-        &mut self,
-        title: &str,
-        bounds: Rectangle,
-        options: i32,
-    ) -> i32 {
-        let identifier = self.get_identifier(title.as_bytes());
-        let container_idx = match self.fetch_container(identifier, options) {
-            Some(idx) if self.container_pool.items[idx].open => idx,
-            _ => return 0,
-        };
-        self.identifiers.push(identifier);
+fn render_scrollbar(ctx: &mut Context, idx: usize, body: &Rect, content: Vec2, vertical: bool) {
+    let size = ctx.style.scroll_size;
+    let thumb_min = ctx.style.thumb_size;
 
-        {
-            let container = &mut self.container_pool.items[container_idx];
-            if container.bounds.width == 0 {
-                container.bounds = bounds;
-            }
-        }
+    let (content_size, viewport_size) = if vertical {
+        (content.y, body.h)
+    } else {
+        (content.x, body.w)
+    };
 
-        self.begin_root(container_idx);
-
-        let style = unsafe { &*self.style };
-
-        if options & NO_FRAME == 0 {
-            let draw = self.draw_frame;
-            let container_bounds = self.container_pool.items[container_idx].bounds;
-            draw(self, container_bounds, ColorIndex::Window);
-        }
-
-        if options & NO_TITLE == 0 {
-            let container_bounds = self.container_pool.items[container_idx].bounds;
-            let mut title_bounds = Rectangle::new(
-                container_bounds.x, container_bounds.y,
-                container_bounds.width, style.title_height,
-            );
-            let draw = self.draw_frame;
-            draw(self, title_bounds, ColorIndex::Title);
-
-            let title_id = self.get_identifier("!title".as_bytes());
-            self.update_control(title_id, title_bounds, options);
-            self.control_text(title, title_bounds, ColorIndex::Heading, options);
-            if title_id == self.focus && self.mouse_down == MOUSE_LEFT {
-                let container = &mut self.container_pool.items[container_idx];
-                container.bounds.x += self.mouse_delta.x;
-                container.bounds.y += self.mouse_delta.y;
-            }
-
-            let container_bounds = self.container_pool.items[container_idx].bounds;
-            title_bounds = Rectangle::new(
-                container_bounds.x, container_bounds.y,
-                container_bounds.width, style.title_height,
-            );
-
-            if options & NO_CLOSE == 0 {
-                let close_id = self.get_identifier("!close".as_bytes());
-                let close_size = title_bounds.height;
-                let close_rect = Rectangle::new(
-                    title_bounds.x + title_bounds.width - close_size,
-                    title_bounds.y,
-                    close_size,
-                    close_size,
-                );
-                draw_icon(
-                    self,
-                    1,
-                    close_rect,
-                    style.colors[ColorIndex::Heading as usize],
-                );
-                self.update_control(close_id, close_rect, options);
-                if self.mouse_pressed == MOUSE_LEFT && close_id == self.focus {
-                    let container = &mut self.container_pool.items[container_idx];
-                    container.open = false;
-                }
-            }
-        }
-
-        let body = {
-            let container = &self.container_pool.items[container_idx];
-            let mut b = container.bounds;
-            if options & NO_TITLE == 0 {
-                b.y += style.title_height;
-                b.height -= style.title_height;
-            }
-            b
-        };
-
-        self.push_body(container_idx, body, options);
-
-        if options & NO_RESIZE == 0 {
-            let size = style.title_height;
-            let resize_id = self.get_identifier("!resize".as_bytes());
-            let resize_rect = {
-                let cb = self.container_pool.items[container_idx].bounds;
-                Rectangle::new(
-                    cb.x + cb.width - size,
-                    cb.y + cb.height - size,
-                    size,
-                    size,
-                )
-            };
-            self.update_control(resize_id, resize_rect, options);
-            if resize_id == self.focus && self.mouse_down == MOUSE_LEFT {
-                let container = &mut self.container_pool.items[container_idx];
-                container.bounds.width = cmp::max(96, container.bounds.width + self.mouse_delta.x);
-                container.bounds.height = cmp::max(64, container.bounds.height + self.mouse_delta.y);
-            }
-        }
-
-        if options & AUTO_SIZE != 0 {
-            let layout_body = self.current_layout().body;
-            let container = &mut self.container_pool.items[container_idx];
-            container.bounds.width = container.content.x + (container.bounds.width - layout_body.width);
-            container.bounds.height = container.content.y + (container.bounds.height - layout_body.height);
-        }
-
-        if options & IS_POPUP != 0
-            && self.mouse_pressed != 0
-            && self.hover_root != Some(container_idx)
-        {
-            let container = &mut self.container_pool.items[container_idx];
-            container.open = false;
-        }
-
-        let container_body = self.container_pool.items[container_idx].body;
-        self.push_clip(container_body);
-        RESULT_ACTIVE
-    }
-
-    pub fn pop_window(&mut self) {
-        self.pop_clip();
-        self.end_root();
-    }
-
-    pub fn open_popup(&mut self, name: &str) {
-        let container_idx = self.find_container(name).expect("popup not found");
-        self.hover_root = Some(container_idx);
-        self.next_root = Some(container_idx);
-        let container = &mut self.container_pool.items[container_idx];
-        container.bounds = Rectangle::new(self.mouse.x, self.mouse.y, 1, 1);
-        container.open = true;
-        self.bring_front(container_idx);
-    }
-
-    pub fn push_popup(&mut self, name: &str) -> i32 {
-        let options = IS_POPUP | AUTO_SIZE | NO_RESIZE | NO_SCROLL | NO_TITLE | IS_CLOSED;
-        self.push_window(name, Rectangle::new(0, 0, 0, 0), options)
-    }
-
-    pub fn pop_popup(&mut self) {
-        self.pop_window();
-    }
-
-    pub fn push_panel(&mut self, name: &str, options: i32) {
-        self.push_identifier(name.as_bytes());
-        let identifier = self.last_identifier;
-        let container_idx = self.fetch_container(identifier, options)
-            .expect("panel container");
-        let bounds = self.next_bounds();
-        {
-            let container = &mut self.container_pool.items[container_idx];
-            container.bounds = bounds;
-        }
-        if options & NO_FRAME == 0 {
-            let draw = self.draw_frame;
-            draw(self, bounds, ColorIndex::Panel);
-        }
-        self.containers_stack.push(container_idx);
-        self.push_body(container_idx, bounds, options);
-        let body = self.container_pool.items[container_idx].body;
-        self.push_clip(body);
-    }
-
-    pub fn pop_panel(&mut self) {
-        self.pop_clip();
-        self.pop_container();
-    }
-
-    fn push_body(&mut self, container_idx: usize, mut body: Rectangle, options: i32) {
-        let style = unsafe { &*self.style };
-        if options & NO_SCROLL == 0 {
-            self.render_scrollbars(container_idx, &mut body);
-        }
-        let scroll = self.container_pool.items[container_idx].scroll;
-        self.push_layout(body.expand(-style.padding), scroll);
-        self.container_pool.items[container_idx].body = body;
-    }
-
-    fn begin_root(&mut self, container_idx: usize) {
-        let head_idx = push_jump(self);
-        {
-            let container = &mut self.container_pool.items[container_idx];
-            container.head = head_idx;
-            if container.bounds.contains_point(self.mouse)
-                && (self.next_root.is_none()
-                || container.depth > self.container_pool.items[self.next_root.unwrap()].depth)
-            {
-                self.next_root = Some(container_idx);
-            }
-        }
-        self.containers_stack.push(container_idx);
-        self.roots.push(container_idx);
-        self.clips.push(Rectangle::unbounded());
-    }
-
-    fn end_root(&mut self) {
-        let container_idx = self.containers_stack.last().copied().unwrap();
-        let tail_idx = push_jump(self);
-        {
-            let container = &mut self.container_pool.items[container_idx];
-            container.tail = tail_idx;
-            self.instructions[container.head] = Instruction::Jump {
-                target: container.tail + 1,
-            };
-        }
-        self.clips.pop();
-        self.pop_container();
-    }
-
-    fn render_scrollbars(&mut self, container_idx: usize, bounds: &mut Rectangle) {
-        let style = unsafe { &*self.style };
-        let size = style.scroll_size;
-        let mut content;
-        let body_height;
-        let body_width;
-        {
-            let container = &self.container_pool.items[container_idx];
-            content = container.content;
-            content.x += style.padding * 2;
-            content.y += style.padding * 2;
-            body_height = container.body.height;
-            body_width = container.body.width;
-        }
-        self.push_clip(*bounds);
-        if content.y > body_height {
-            bounds.width -= size;
-        }
-        if content.x > body_width {
-            bounds.height -= size;
-        }
-        self.render_scrollbar(container_idx, bounds, content, true);
-        self.render_scrollbar(container_idx, bounds, content, false);
-        self.pop_clip();
-    }
-
-    fn render_scrollbar(
-        &mut self,
-        container_idx: usize,
-        bounds: &Rectangle,
-        content: Vector,
-        vertical: bool,
-    ) {
-        let (content_size, viewport_size) = if vertical {
-            (content.y, bounds.height)
-        } else {
-            (content.x, bounds.width)
-        };
-
-        let max_scroll = content_size - viewport_size;
-        if max_scroll <= 0 || viewport_size <= 0 {
-            let container = &mut self.container_pool.items[container_idx];
-            if vertical {
-                container.scroll.y = 0;
-            } else {
-                container.scroll.x = 0;
-            }
-            return;
-        }
-
-        let style = unsafe { &*self.style };
-        let mut base = *bounds;
-        let identifier = if vertical {
-            base.x = bounds.x + bounds.width;
-            base.width = style.scroll_size;
-            self.get_identifier("!scrollbar_y".as_bytes())
-        } else {
-            base.y = bounds.y + bounds.height;
-            base.height = style.scroll_size;
-            self.get_identifier("!scrollbar_x".as_bytes())
-        };
-
-        self.update_control(identifier, base, 0);
-
-        let scroll = if vertical {
-            self.container_pool.items[container_idx].scroll.y
-        } else {
-            self.container_pool.items[container_idx].scroll.x
-        };
-
-        let mut thumb = base;
+    let max_scroll = content_size - viewport_size;
+    if max_scroll <= 0 {
         if vertical {
-            thumb.height = cmp::max(
-                style.thumb_size,
-                base.height * viewport_size / content_size,
-            );
-            thumb.y += scroll * (base.height - thumb.height) / max_scroll;
+            ctx.context_containers()[idx].scroll.y = 0;
         } else {
-            thumb.width = cmp::max(
-                style.thumb_size,
-                base.width * viewport_size / content_size,
-            );
-            thumb.x += scroll * (base.width - thumb.width) / max_scroll;
+            ctx.context_containers()[idx].scroll.x = 0;
         }
+        return;
+    }
 
-        if self.focus == identifier && self.mouse_down == MOUSE_LEFT {
-            let container = &mut self.container_pool.items[container_idx];
-            if vertical {
-                let delta = self.mouse_delta.y;
-                container.scroll.y += delta * content_size / base.height;
-            } else {
-                let delta = self.mouse_delta.x;
-                container.scroll.x += delta * content_size / base.width;
-            }
-        } else if self.hover == identifier && self.mouse_pressed == MOUSE_LEFT {
-            let container = &mut self.container_pool.items[container_idx];
-            if vertical {
-                if self.mouse.y < thumb.y {
-                    container.scroll.y -= viewport_size;
-                } else if self.mouse.y > thumb.y + thumb.height {
-                    container.scroll.y += viewport_size;
-                }
-            } else {
-                if self.mouse.x < thumb.x {
-                    container.scroll.x -= viewport_size;
-                } else if self.mouse.x > thumb.x + thumb.width {
-                    container.scroll.x += viewport_size;
-                }
-            }
+    let base = if vertical {
+        Rect::new(body.x + body.w, body.y, size, body.h)
+    } else {
+        Rect::new(body.x, body.y + body.h, body.w, size)
+    };
+
+    let bar_id = if vertical { ctx.id_str("!scrollbar_y") } else { ctx.id_str("!scrollbar_x") };
+    controls::update(ctx, bar_id, base, Options::empty());
+
+    let scroll = if vertical {
+        ctx.context_containers()[idx].scroll.y
+    } else {
+        ctx.context_containers()[idx].scroll.x
+    };
+
+    let visible = if vertical {
+        (thumb_min).max(base.h * viewport_size / content_size)
+    } else {
+        (thumb_min).max(base.w * viewport_size / content_size)
+    };
+
+    let mut thumb = base;
+    if vertical {
+        thumb.h = visible;
+        thumb.y += scroll * (base.h - visible) / max_scroll;
+    } else {
+        thumb.w = visible;
+        thumb.x += scroll * (base.w - visible) / max_scroll;
+    }
+
+    if ctx.focus == bar_id && ctx.mouse_down == Mouse::Left as u32 {
+        let delta = if vertical { ctx.delta.y } else { ctx.delta.x };
+        let track = if vertical { base.h } else { base.w };
+        let new_scroll = scroll + delta * content_size / track;
+        if vertical {
+            ctx.context_containers()[idx].scroll.y = new_scroll.clamp(0, max_scroll);
+        } else {
+            ctx.context_containers()[idx].scroll.x = new_scroll.clamp(0, max_scroll);
         }
+    }
 
-        {
-            let container = &mut self.container_pool.items[container_idx];
-            if vertical {
-                container.scroll.y = container.scroll.y.clamp(0, max_scroll);
-                let scroll = container.scroll.y;
-                thumb.y = base.y + scroll * (base.height - thumb.height) / max_scroll;
-            } else {
-                container.scroll.x = container.scroll.x.clamp(0, max_scroll);
-                let scroll = container.scroll.x;
-                thumb.x = base.x + scroll * (base.width - thumb.width) / max_scroll;
-            }
-        }
+    let scroll_color = ctx.style.color(ColorSlot::Scroll);
+    let thumb_color = ctx.style.color(ColorSlot::Thumb);
+    ctx.draws.rect(base, scroll_color);
+    ctx.draws.rect(thumb, thumb_color);
 
-        let draw = self.draw_frame;
-        draw(self, base, ColorIndex::Scroll);
-        draw(self, thumb, ColorIndex::Thumb);
-
-        if self.mouse_over(*bounds) {
-            self.scroll_target = Some(container_idx);
-        }
+    if body.contains(ctx.mouse) {
+        ctx.scroll_target = Some(idx);
     }
 }

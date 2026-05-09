@@ -151,7 +151,7 @@ pub fn slider(
     low: f32,
     high: f32,
     step: f32,
-    format: &str,
+    _format: &str,
     options: Options,
 ) -> Response {
     let addr = (value as *const f32 as usize).to_le_bytes();

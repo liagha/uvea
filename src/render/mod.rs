@@ -3,7 +3,9 @@ pub mod pipeline;
 pub mod text;
 pub mod vertex;
 
+use std::sync::Arc;
 use wgpu::*;
+use winit::window::Window;
 use crate::{
     draw::Command,
     render::{
@@ -88,6 +90,79 @@ impl Renderer {
         }
     }
 
+    // In src/render/mod.rs, modify the new_with_window method:
+
+    // In src/render/mod.rs, update the new_with_window method:
+
+    pub async fn new_with_window(
+        window: Arc<Window>,
+        width: u32,
+        height: u32,
+        font_data: Vec<u8>,
+        font_size: u32,
+    ) -> Self {
+        let instance = wgpu::Instance::default();
+
+        let surface = instance.create_surface(window).expect("create surface");
+
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .expect("no adapter");
+
+        let (device, queue) = adapter
+            .request_device(
+                &DeviceDescriptor {
+                    required_features: Features::empty(),
+                    required_limits: Limits::default(),
+                    label: None,
+                    memory_hints: MemoryHints::default(),
+                    experimental_features: ExperimentalFeatures::default(),
+                    trace: Trace::Off,
+                },
+            )
+            .await
+            .expect("no device");
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats.iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+
+        surface.configure(&device, &SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width,
+            height,
+            present_mode: PresentMode::AutoVsync,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        });
+
+        let atlas_size = 2048u32;
+        let pipeline = Pipeline::new(&device, format, atlas_size);
+        let atlas = Atlas::new(atlas_size);
+        let shaper = Shaper::from_bytes(font_data, font_size);
+
+        Self {
+            device,
+            queue,
+            adapter,
+            surface,
+            format,
+            pipeline,
+            atlas,
+            batch: Batch::new(),
+            shaper,
+            width,
+            height,
+        }
+    }
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 { return; }
         self.width = width;

@@ -459,11 +459,11 @@ impl ApplicationHandler for GalleryApp {
             .with_inner_size(Size::Logical(LogicalSize::new(700.0, 540.0)));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let size = window.inner_size();
-        let surface = wgpu::Instance::default()
-            .create_surface(window.clone())
-            .expect("create wgpu surface");
-        let renderer = pollster::block_on(Renderer::new(
-            surface,
+
+        // Use the winit window directly to create the surface
+        // Instead of creating a new wgpu instance, derive the surface from winit
+        let renderer = pollster::block_on(Renderer::new_with_window(
+            window.clone(),
             size.width,
             size.height,
             load_font_data(),
